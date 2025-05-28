@@ -4,7 +4,7 @@
 This repository is based on the [nanoGPT](https://github.com/karpathy/nanoGPT) commit [93a43d9](https://github.com/karpathy/nanogpt/commit/93a43d9a5c22450bbf06e78da2cb6eeef084b717).
 
 Our changes include the implementation and use of dynamic activation functions (DyT, DyISRU) in addition to layer normalization (LN). 
-They have been added in a single commit [TODO](https://github.com/abcde17/dynamic-activation-functions/commit/TODO) in order to facilitate comparison.
+They have been added in a single commit [deca29d](https://github.com/abcde17/dynamic-activation-functions/commit/deca29dbd5cd572b3beb1c0fd88f562c7dadd6f9) in order to facilitate comparison.
 
 ## 1. Preparation
 
