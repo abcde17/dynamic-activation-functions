@@ -20,14 +20,18 @@ import os
 import time
 import math
 import pickle
+import random
 from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+
+os.environ['PYTHONHASHSEED']=str(0)
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -53,7 +57,7 @@ n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+bias = True # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -72,6 +76,12 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+normalization = 'ln'
+init_alpha = 0.5
+init_alpha_attn = 0.5
+init_beta = 100
+init_beta_attn = 100
+seed = 1
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -103,7 +113,11 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+
+random.seed(seed + seed_offset)
+np.random.seed(seed + seed_offset)
+torch.manual_seed(seed + seed_offset)
+
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -145,7 +159,9 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, 
+                  normalization=normalization, init_alpha=init_alpha, init_beta=init_beta,
+                  init_alpha_attn=init_alpha_attn, init_beta_attn=init_beta_attn) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -249,9 +265,42 @@ if wandb_log and master_process:
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
+t0_total = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+nr_norms = len(raw_model.transformer.h) + 1
+
+def get_alpha_dict(_raw_model: nn.Module) -> dict[str, torch.Tensor]:
+    alpha = [[
+            _raw_model.transformer.h[i].ln_1.alpha,
+            _raw_model.transformer.h[i].ln_2.alpha,
+        ]
+        for i in range(nr_norms-1)
+    ] 
+    alpha = [elem for sublist in alpha for elem in sublist]  # flatten
+    alpha += [_raw_model.transformer.ln_f.alpha]
+    _alpha_dict = {
+        f'alpha/alpha_{i}': alpha[i].detach()
+        for i in range(len(alpha))
+    }
+    return _alpha_dict
+
+def get_beta_dict(_raw_model: nn.Module) -> dict[str, torch.Tensor]:
+    beta = [[
+            _raw_model.transformer.h[i].ln_1.beta,
+            _raw_model.transformer.h[i].ln_2.beta,
+        ]
+        for i in range(nr_norms-1)
+    ] 
+    beta = [elem for sublist in beta for elem in sublist]  # flatten
+    beta += [_raw_model.transformer.ln_f.beta]
+    _beta_dict = {
+        f'beta/beta_{i}': beta[i].detach()
+        for i in range(len(beta))
+    }
+    return _beta_dict
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -263,14 +312,22 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
         if wandb_log:
-            wandb.log({
+            wandb_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if normalization.startswith('dyt'):
+                alpha_dict = get_alpha_dict(raw_model)
+                wandb_dict = wandb_dict | alpha_dict
+            elif normalization.startswith('dyisru'):
+                beta_dict = get_beta_dict(raw_model)
+                wandb_dict = wandb_dict | beta_dict
+            wandb.log(wandb_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -334,3 +391,14 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+t1_total = time.time()
+dt_total = t1_total - t0_total
+print()
+print(f"> total time = {dt_total:.1f}s | steps = {max_iters} | total time / steps = {dt_total / max_iters:.4f}s")
+if wandb_log and master_process:
+    wandb.log({
+        "time/total": dt_total,
+        "time/per_step": dt_total / max_iters,
+    })
+print("> DONE.")
