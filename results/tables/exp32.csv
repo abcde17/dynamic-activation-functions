@@ -1,0 +1,9 @@
+,LN,DyT,DyISRU,DyISRU < DyT
+$\mathcal{L}_1$,2.851,2.980,2.975,True
+$\mathcal{L}_2$,,2.926,2.933,False
+$\mathcal{L}_{12}$,,0.054,0.042,True
+$\mathcal{I}_1$,,0.200,0.200,
+$\mathcal{I}_2$,,0.240,0.240,
+$\mathcal{S}_1$,,0.022,0.029,False
+$\mathcal{S}_2$,,0.059,0.059,True
+$\mathcal{T}$,0.648,0.649(6),0.652(5),
